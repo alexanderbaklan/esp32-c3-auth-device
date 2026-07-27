@@ -11,6 +11,9 @@
 #define WIFI_SSID  "your-wifi-ssid"
 #define WIFI_PASS  "your-wifi-password"
 
+// ==================== Web UI Credentials ====================
+#define WEB_PASSWORD "admin"
+
 // ==================== TOTP accounts ====================
 // Secrets are Base32 (as exported by Google Authenticator).
 struct TotpAccount {
