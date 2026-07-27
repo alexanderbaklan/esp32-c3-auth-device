@@ -47,13 +47,35 @@
 #include <time.h>
 #include <sys/time.h>
 
-// Private config: WiFi credentials + TotpAccount/ACCOUNTS (gitignored).
-// Copy include/secrets.example.h to include/secrets.h and fill in your values.
-#include "secrets.h"
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <vector>
 
-// ==================== WiFi / NTP ====================
-#define NTP_SERVER     "162.159.200.1"   // Cloudflare NTP (IP -> no DNS lookup)
-#define GMT_OFFSET_SEC 7200              // UTC+2 (display clock only)
+// Private config: WiFi credentials + TotpAccount/ACCOUNTS (gitignored).
+#include "secrets.h"
+#include "web_ui.h"
+
+// ==================== Dynamic Config Variables ====================
+String settings_wifi_ssid;
+String settings_wifi_pass;
+String settings_web_pass;
+String settings_ntp_server;
+int32_t settings_gmt_offset;
+uint8_t settings_num_slots;
+String settings_slot_labels[8];
+
+struct DynamicTotpAccount {
+  String name;
+  String secret_b32;
+};
+std::vector<DynamicTotpAccount> settings_accounts;
+
+// Web Server variables
+WebServer server(80);
+String sessionToken = "";
+bool webServerStarted = false;
+bool gApMode = false;
+
 #define DST_OFFSET_SEC 0
 
 // ==================== Display ====================
@@ -72,32 +94,6 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define BTN_SLOT   3    // GPIO3 — short: switch slot; hold: clear slot
 
 // ==================== BLE multi-device ("one identity per slot") ============
-// Each slot = a unique BLE MAC (esp_base_mac_addr_set before the BLE stack
-// init), so every host stores its bond independently. Switching a slot changes
-// the MAC -> done by saving the slot number to NVS and ESP.restart() (changing
-// the MAC on the fly is unreliable in NimBLE-Arduino). A bonded host reconnects
-// on its own via normal advertising as soon as we bring "its" slot up.
-//
-// NUM_SLOTS: 1 to 8 (upper bound = CONFIG_BT_NIMBLE_MAX_BONDS in platformio.ini).
-// Each slot has a hardcoded name from SLOT_LABELS, shown on the display and used
-// in the BLE device name ("TOTP Phone"). To add/remove a slot: change NUM_SLOTS
-// and SLOT_LABELS so there are at least NUM_SLOTS names.
-static const uint8_t NUM_SLOTS = 2;
-
-static const char* SLOT_LABELS[] = {
-  "Laptop",
-  "Phone",
-  "Slot 3",
-  "Slot 4",
-  "Slot 5",
-  "Slot 6",
-  "Slot 7",
-  "Slot 8",
-};
-static_assert(NUM_SLOTS >= 1 && NUM_SLOTS <= 8, "NUM_SLOTS must be 1..8");
-static_assert(sizeof(SLOT_LABELS) / sizeof(SLOT_LABELS[0]) >= NUM_SLOTS,
-              "SLOT_LABELS must have at least NUM_SLOTS entries");
-
 NimBLEServer*         pServer  = nullptr;
 NimBLEHIDDevice*      pHid     = nullptr;
 NimBLECharacteristic* pInput   = nullptr;   // Input Report (keys -> host)
@@ -107,11 +103,10 @@ volatile bool     gConnected  = false;
 uint8_t           gSlot       = 0;
 bool              gPairingMode = false;     // active slot has no bond yet
 
-// Stored identity address of the bonded host per slot — used for deleteBond
-// when clearing a slot. Not needed for reconnect (the host finds us by MAC).
-bool    slotHasPeer[NUM_SLOTS];
-uint8_t slotPeerAddr[NUM_SLOTS][6];
-uint8_t slotPeerType[NUM_SLOTS];
+// Stored identity address of the bonded host per slot (max 8 slots)
+bool    slotHasPeer[8];
+uint8_t slotPeerAddr[8][6];
+uint8_t slotPeerType[8];
 
 Preferences prefs;               // NVS namespace "kbd"
 
@@ -159,19 +154,280 @@ static const uint8_t KEY_MOD_LSHIFT = 0x02;
 static const uint8_t KEY_ENTER = 0x28;
 static const uint8_t KEY_SPACE = 0x2C;
 
-// ==================== TOTP accounts ====================
-// TotpAccount and ACCOUNTS[] live in include/secrets.h (gitignored).
-const int NUM_ACCOUNTS = sizeof(ACCOUNTS) / sizeof(ACCOUNTS[0]);
-
+// ==================== Dynamic TOTP accounts state ====================
 int  currentAccount = 0;             // currently selected account
 char currentCode[7] = "------";      // current TOTP code (6 digits)
 long lastCodeTimestamp = 0;          // timestamp of the last generation
 
 // ----------------------------- Prototypes -----------------------------------
 void startAdvertising();
+void generateTOTP();
 // Single screen render. note != nullptr -> the text is shown on the bottom line
 // (the one place for all status messages) instead of the button hints.
 void updateDisplay(const char* note = nullptr);
+
+// ==================== Configuration & Web Server ====================
+void loadConfig() {
+  prefs.begin("config", true); // read-only
+  
+  settings_wifi_ssid = prefs.getString("wifi_ssid", WIFI_SSID);
+  settings_wifi_pass = prefs.getString("wifi_pass", WIFI_PASS);
+  settings_web_pass = prefs.getString("web_pass", WEB_PASSWORD);
+  settings_ntp_server = prefs.getString("ntp_server", "162.159.200.1");
+  settings_gmt_offset = prefs.getInt("gmt_offset", 7200);
+  settings_num_slots = prefs.getUChar("num_slots", 2);
+  
+  if (settings_num_slots < 1 || settings_num_slots > 8) {
+    settings_num_slots = 2;
+  }
+  
+  for (int i = 0; i < 8; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "slot_lbl_%d", i);
+    String defaultLabel;
+    if (i == 0) defaultLabel = "Laptop";
+    else if (i == 1) defaultLabel = "Phone";
+    else defaultLabel = "Slot " + String(i + 1);
+    settings_slot_labels[i] = prefs.getString(key, defaultLabel);
+  }
+  
+  uint8_t num_accts = prefs.getUChar("num_accts", 255);
+  if (num_accts == 255) {
+    settings_accounts.clear();
+    int default_num_accounts = sizeof(ACCOUNTS) / sizeof(ACCOUNTS[0]);
+    for (int i = 0; i < default_num_accounts; i++) {
+      DynamicTotpAccount acc;
+      acc.name = ACCOUNTS[i].name;
+      acc.secret_b32 = ACCOUNTS[i].secret_b32;
+      settings_accounts.push_back(acc);
+    }
+  } else {
+    settings_accounts.clear();
+    for (int i = 0; i < num_accts; i++) {
+      char key_name[16];
+      char key_sec[16];
+      snprintf(key_name, sizeof(key_name), "acc_name_%d", i);
+      snprintf(key_sec, sizeof(key_sec), "acc_sec_%d", i);
+      DynamicTotpAccount acc;
+      acc.name = prefs.getString(key_name, "");
+      acc.secret_b32 = prefs.getString(key_sec, "");
+      if (acc.name.length() > 0 && acc.secret_b32.length() > 0) {
+        settings_accounts.push_back(acc);
+      }
+    }
+  }
+  
+  prefs.end();
+}
+
+void saveConfig() {
+  prefs.begin("config", false); // read-write
+  
+  prefs.putString("wifi_ssid", settings_wifi_ssid);
+  prefs.putString("wifi_pass", settings_wifi_pass);
+  prefs.putString("web_pass", settings_web_pass);
+  prefs.putString("ntp_server", settings_ntp_server);
+  prefs.putInt("gmt_offset", settings_gmt_offset);
+  prefs.putUChar("num_slots", settings_num_slots);
+  
+  for (int i = 0; i < 8; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "slot_lbl_%d", i);
+    prefs.putString(key, settings_slot_labels[i]);
+  }
+  
+  uint8_t old_num_accts = prefs.getUChar("num_accts", 0);
+  for (int i = 0; i < old_num_accts; i++) {
+    char key_name[16];
+    char key_sec[16];
+    snprintf(key_name, sizeof(key_name), "acc_name_%d", i);
+    snprintf(key_sec, sizeof(key_sec), "acc_sec_%d", i);
+    prefs.remove(key_name);
+    prefs.remove(key_sec);
+  }
+  
+  prefs.putUChar("num_accts", settings_accounts.size());
+  for (size_t i = 0; i < settings_accounts.size(); i++) {
+    char key_name[16];
+    char key_sec[16];
+    snprintf(key_name, sizeof(key_name), "acc_name_%d", i);
+    snprintf(key_sec, sizeof(key_sec), "acc_sec_%d", i);
+    prefs.putString(key_name, settings_accounts[i].name);
+    prefs.putString(key_sec, settings_accounts[i].secret_b32);
+  }
+  
+  prefs.end();
+}
+
+void generateSessionToken() {
+  sessionToken = String(random(100000, 999999));
+}
+
+bool isAuthorized() {
+  if (server.hasHeader("Cookie")) {
+    String cookie = server.header("Cookie");
+    if (cookie.indexOf("session=" + sessionToken) != -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void handleLogin() {
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<128> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err && doc.containsKey("password")) {
+      String pass = doc["password"].as<String>();
+      if (pass == settings_web_pass) {
+        generateSessionToken();
+        server.sendHeader("Set-Cookie", "session=" + sessionToken + "; Path=/; HttpOnly");
+        server.send(200, "application/json", "{\"success\":true}");
+        return;
+      }
+    }
+  }
+  server.send(401, "text/plain", "Unauthorized");
+}
+
+void handleLogout() {
+  server.sendHeader("Set-Cookie", "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleGetSettings() {
+  if (!isAuthorized()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  DynamicJsonDocument doc(4096);
+  doc["wifi_ssid"] = settings_wifi_ssid;
+  doc["wifi_pass"] = settings_wifi_pass;
+  doc["ntp_server"] = settings_ntp_server;
+  doc["gmt_offset"] = settings_gmt_offset;
+  doc["num_slots"] = settings_num_slots;
+  
+  JsonArray arrLabels = doc.createNestedArray("slot_labels");
+  for (int i = 0; i < 8; i++) {
+    arrLabels.add(settings_slot_labels[i]);
+  }
+  
+  JsonArray arrAccs = doc.createNestedArray("accounts");
+  for (const auto& acc : settings_accounts) {
+    JsonObject accObj = arrAccs.createNestedObject();
+    accObj["name"] = acc.name;
+    accObj["secret_b32"] = acc.secret_b32;
+  }
+  
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+void handlePostSettings() {
+  if (!isAuthorized()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  if (server.hasArg("plain")) {
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err) {
+      String current_pass = doc["current_pass"].as<String>();
+      if (current_pass != settings_web_pass) {
+        server.send(401, "text/plain", "Invalid current password");
+        return;
+      }
+      
+      if (doc.containsKey("wifi_ssid")) settings_wifi_ssid = doc["wifi_ssid"].as<String>();
+      if (doc.containsKey("wifi_pass")) settings_wifi_pass = doc["wifi_pass"].as<String>();
+      if (doc.containsKey("ntp_server")) settings_ntp_server = doc["ntp_server"].as<String>();
+      if (doc.containsKey("gmt_offset")) settings_gmt_offset = doc["gmt_offset"].as<int32_t>();
+      
+      if (doc.containsKey("num_slots")) {
+        settings_num_slots = doc["num_slots"].as<uint8_t>();
+        if (settings_num_slots < 1) settings_num_slots = 1;
+        if (settings_num_slots > 8) settings_num_slots = 8;
+      }
+      
+      if (doc.containsKey("slot_labels")) {
+        JsonArray arrLabels = doc["slot_labels"].as<JsonArray>();
+        for (size_t i = 0; i < arrLabels.size() && i < 8; i++) {
+          settings_slot_labels[i] = arrLabels[i].as<String>();
+        }
+      }
+      
+      if (doc.containsKey("accounts")) {
+        settings_accounts.clear();
+        JsonArray arrAccs = doc["accounts"].as<JsonArray>();
+        for (size_t i = 0; i < arrAccs.size(); i++) {
+          JsonObject accObj = arrAccs[i].as<JsonObject>();
+          DynamicTotpAccount acc;
+          acc.name = accObj["name"].as<String>();
+          acc.secret_b32 = accObj["secret_b32"].as<String>();
+          if (acc.name.length() > 0 && acc.secret_b32.length() > 0) {
+            settings_accounts.push_back(acc);
+          }
+        }
+      }
+      
+      if (doc.containsKey("new_pass")) {
+        String new_pass = doc["new_pass"].as<String>();
+        if (new_pass.length() > 0) {
+          settings_web_pass = new_pass;
+        }
+      }
+      
+      saveConfig();
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Bad Request");
+}
+
+void handleReboot() {
+  server.send(200, "text/plain", "OK");
+  delay(500);
+  ESP.restart();
+}
+
+void startWebServer() {
+  const char* headerkeys[] = {"Cookie"};
+  size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*);
+  server.collectHeaders(headerkeys, headerkeyssize);
+  
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", WEB_UI_HTML);
+  });
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/logout", HTTP_POST, handleLogout);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/settings", HTTP_POST, handlePostSettings);
+  server.on("/api/reboot", HTTP_POST, handleReboot);
+  
+  server.begin();
+  webServerStarted = true;
+  Serial.println("[Web] Web server started on port 80");
+}
+
+void startAP() {
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char apSSID[32];
+  snprintf(apSSID, sizeof(apSSID), "TOTP-Setup-%02X%02X", mac[4], mac[5]);
+  
+  WiFi.softAP(apSSID, "12345678");
+  gApMode = true;
+  Serial.printf("[WiFi] AP started. SSID: %s, IP: %s\n", apSSID, WiFi.softAPIP().toString().c_str());
+  
+  startWebServer();
+}
 
 // ==================== Base32 decoder ====================
 int base32Decode(const char* encoded, uint8_t* output, int outLen) {
@@ -196,13 +452,18 @@ int base32Decode(const char* encoded, uint8_t* output, int outLen) {
 
 // ==================== TOTP generation ====================
 void generateTOTP() {
+  if (settings_accounts.empty()) {
+    strcpy(currentCode, "------");
+    return;
+  }
+
   if (!gTimeSynced) {
     strcpy(currentCode, "NOSYNC");
     return;
   }
 
   uint8_t hmacKey[32];
-  int keyLen = base32Decode(ACCOUNTS[currentAccount].secret_b32, hmacKey, sizeof(hmacKey));
+  int keyLen = base32Decode(settings_accounts[currentAccount].secret_b32.c_str(), hmacKey, sizeof(hmacKey));
   if (keyLen <= 0) {
     strcpy(currentCode, "ERROR");
     return;
@@ -219,7 +480,7 @@ void generateTOTP() {
     currentCode[6] = '\0';
     lastCodeTimestamp = now;
     Serial.printf("TOTP [%s]: %s (t=%ld)\n",
-                  ACCOUNTS[currentAccount].name, currentCode, (long)now);
+                  settings_accounts[currentAccount].name.c_str(), currentCode, (long)now);
   } else {
     strcpy(currentCode, "FAIL");
   }
@@ -283,12 +544,12 @@ static void typeText(const char* text) {
 void loadSlotState() {
   prefs.begin("kbd", true);      // read-only
   gSlot = prefs.getUChar("slot", 0);
-  if (gSlot >= NUM_SLOTS) gSlot = 0;
+  if (gSlot >= settings_num_slots) gSlot = 0;
 
   currentAccount = prefs.getUChar("acct", 0);
-  if (currentAccount >= NUM_ACCOUNTS) currentAccount = 0;
+  if (currentAccount >= (int)settings_accounts.size()) currentAccount = 0;
 
-  for (int i = 0; i < NUM_SLOTS; i++) {
+  for (int i = 0; i < settings_num_slots; i++) {
     char key[8];
     snprintf(key, sizeof(key), "hasp%d", i);
     slotHasPeer[i] = prefs.getBool(key, false);
@@ -378,7 +639,7 @@ void startAdvertising() {
 
 static void initBle() {
   char name[24];
-  snprintf(name, sizeof(name), "TOTP %s", SLOT_LABELS[gSlot]);
+  snprintf(name, sizeof(name), "TOTP %s", settings_slot_labels[gSlot].c_str());
 
   setSlotMac(gSlot);                                  // MAC — strictly before init()
 
@@ -414,11 +675,11 @@ static void initBle() {
 
 // Switch slot: save to NVS and reboot (the new MAC is applied at startup).
 void switchToSlot(uint8_t slot) {
-  slot %= NUM_SLOTS;
+  slot %= settings_num_slots;
   Serial.printf("BLE: switching to slot %u (%s) -> reboot\n",
-                (unsigned)slot, SLOT_LABELS[slot]);
+                (unsigned)slot, settings_slot_labels[slot].c_str());
   char msg[24];
-  snprintf(msg, sizeof(msg), "-> %s", SLOT_LABELS[slot]);
+  snprintf(msg, sizeof(msg), "-> %s", settings_slot_labels[slot].c_str());
   updateDisplay(msg);
   prefs.begin("kbd", false);
   prefs.putUChar("slot", slot);
@@ -458,7 +719,7 @@ void clearSlot() {
   startAdvertising();
 
   char msg[24];
-  snprintf(msg, sizeof(msg), "Pairing: %s", SLOT_LABELS[gSlot]);
+  snprintf(msg, sizeof(msg), "Pairing: %s", settings_slot_labels[gSlot].c_str());
   updateDisplay(msg);
   delay(600);
 }
@@ -472,13 +733,13 @@ void updateDisplay(const char* note) {
   // === Line 1: slot name + BLE status + clock ===
   display.setCursor(0, 0);
   const char* status = gConnected ? "ready" : (gPairingMode ? "Pair" : "wait");
-  display.printf("%s %s", SLOT_LABELS[gSlot], status);
+  display.printf("%s %s", settings_slot_labels[gSlot].c_str(), status);
 
   // Clock on the right (local = UTC + offset)
   if (gTimeSynced) {
     time_t now;
     time(&now);
-    time_t local = now + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+    time_t local = now + settings_gmt_offset + DST_OFFSET_SEC;
     struct tm tmv;
     gmtime_r(&local, &tmv);
     char timeBuf[6];
@@ -492,8 +753,8 @@ void updateDisplay(const char* note) {
 
   // === Line 2: [N/M] account name ===
   display.setCursor(0, 13);
-  display.printf("[%d/%d] ", currentAccount + 1, NUM_ACCOUNTS);
-  display.print(ACCOUNTS[currentAccount].name);
+  display.printf("[%d/%d] ", settings_accounts.empty() ? 0 : currentAccount + 1, (int)settings_accounts.size());
+  display.print(settings_accounts.empty() ? "None" : settings_accounts[currentAccount].name.c_str());
 
   // === Center: TOTP code in a large font "XXX XXX" ===
   display.setTextSize(2);
@@ -517,10 +778,14 @@ void updateDisplay(const char* note) {
   display.print(secBuf);
 
   // === Bottom line: status message OR button hints ===
-  // The single place for all status messages (note). No note -> hints.
   display.setCursor(0, 56);
+  bool showIP = (millis() / 3000) % 2 == 0;
   if (note) {
     display.print(note);
+  } else if (showIP && gWifiUp) {
+    display.printf("IP: %s", WiFi.localIP().toString().c_str());
+  } else if (showIP && gApMode) {
+    display.printf("AP: 192.168.4.1");
   } else {
     display.print("#-send code *-switch");
   }
@@ -528,7 +793,6 @@ void updateDisplay(const char* note) {
 }
 
 // ==================== WiFi / NTP ====================
-// Event callback: capture the moment we get an IP and cache the AP BSSID/channel.
 static void onWifiEvent(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -554,7 +818,9 @@ static void onWifiEvent(WiFiEvent_t event) {
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       gWifiUp = false;
-      WiFi.reconnect();
+      if (!gApMode) {
+        WiFi.reconnect();
+      }
       break;
     default:
       break;
@@ -578,10 +844,10 @@ void startWifi() {
 
   if (gApHint.valid) {
     Serial.printf("[WiFi] direct connect ch=%d\n", gApHint.channel);
-    WiFi.begin(WIFI_SSID, WIFI_PASS, gApHint.channel, gApHint.bssid);
+    WiFi.begin(settings_wifi_ssid.c_str(), settings_wifi_pass.c_str(), gApHint.channel, gApHint.bssid);
   } else {
     Serial.println("[WiFi] full scan connect (learning AP)");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(settings_wifi_ssid.c_str(), settings_wifi_pass.c_str());
   }
 }
 
@@ -598,7 +864,12 @@ static void ntpSendRequest() {
   uint8_t pkt[48] = {0};
   pkt[0] = 0b11100011;   // LI=3, Version=4, Mode=3 (client)
   IPAddress srv;
-  srv.fromString(NTP_SERVER);
+  if (!srv.fromString(settings_ntp_server)) {
+    if (!WiFi.hostByName(settings_ntp_server.c_str(), srv)) {
+      Serial.printf("[NTP] DNS resolve failed for: %s\n", settings_ntp_server.c_str());
+      return;
+    }
+  }
   gNtpUdp.beginPacket(srv, NTP_PORT);
   gNtpUdp.write(pkt, sizeof(pkt));
   gNtpUdp.endPacket();
@@ -734,25 +1005,26 @@ static uint8_t pollButton(Button& b) {
 }
 
 static void handleButton(uint8_t pin, uint8_t event) {
+  int numAccs = settings_accounts.size();
   switch (pin) {
     case BTN_PREV:
-      if (event == 1) {
-        currentAccount = (currentAccount - 1 + NUM_ACCOUNTS) % NUM_ACCOUNTS;
+      if (event == 1 && numAccs > 0) {
+        currentAccount = (currentAccount - 1 + numAccs) % numAccs;
         generateTOTP();
         updateDisplay();
       }
       break;
 
     case BTN_NEXT:
-      if (event == 1) {
-        currentAccount = (currentAccount + 1) % NUM_ACCOUNTS;
+      if (event == 1 && numAccs > 0) {
+        currentAccount = (currentAccount + 1) % numAccs;
         generateTOTP();
         updateDisplay();
       }
       break;
 
     case BTN_GEN:
-      if (event == 1) {
+      if (event == 1 && numAccs > 0) {
         generateTOTP();
         if (gConnected) {
           typeText(currentCode);
@@ -770,7 +1042,7 @@ static void handleButton(uint8_t pin, uint8_t event) {
 
     case BTN_SLOT:
       if (event == 1) {
-        switchToSlot((gSlot + 1) % NUM_SLOTS);   // reboot
+        switchToSlot((gSlot + 1) % settings_num_slots);   // reboot
       } else if (event == 2) {
         clearSlot();
         updateDisplay();
@@ -787,6 +1059,8 @@ void setup() {
   while (!Serial && (millis() - serialWait < 2000)) delay(10);
   Serial.println("\n=== ESP32 TOTP Device ===");
 
+  randomSeed(analogRead(0));
+
   // --- Buttons (external 4.7k pull-up) ---
   for (uint8_t i = 0; i < NUM_BTN; ++i) pinMode(gButtons[i].pin, INPUT);
 
@@ -802,6 +1076,9 @@ void setup() {
   updateDisplay("Starting...");
   delay(300);
 
+  // --- Load configuration from NVS ---
+  loadConfig();
+
   // --- Load slots from NVS ---
   loadSlotState();
 
@@ -809,6 +1086,22 @@ void setup() {
   updateDisplay("Connecting WiFi..");
   startWifi();
   syncTimeBlocking(6000, 3000);
+
+  // syncTimeBlocking may return instantly on warm restart (RTC time valid),
+  // before WiFi has connected. Give WiFi a separate chance to come up.
+  if (!gWifiUp) {
+    Serial.println("[boot] Waiting for WiFi (post-sync)...");
+    uint32_t wifiWait = millis();
+    while (!gWifiUp && (millis() - wifiWait) < 6000) delay(10);
+  }
+
+  if (!gWifiUp) {
+    Serial.println("[boot] WiFi connection failed. Starting AP Fallback mode.");
+    startAP();
+  } else {
+    // WiFi connected successfully! Start server on STA.
+    startWebServer();
+  }
 
   // --- BLE for the active slot ---
   updateDisplay("Starting BLE..");
@@ -820,6 +1113,11 @@ void setup() {
 }
 
 void loop() {
+  // Web Server
+  if (webServerStarted) {
+    server.handleClient();
+  }
+
   // Buttons
   for (uint8_t i = 0; i < NUM_BTN; ++i) {
     uint8_t ev = pollButton(gButtons[i]);
@@ -837,7 +1135,7 @@ void loop() {
     }
   }
 
-  // Refresh the display once a second (progress bar)
+  // Refresh the display once a second (progress bar / IP alternating)
   static uint32_t lastDisplay = 0;
   uint32_t now = millis();
   if (now - lastDisplay > 1000) {
